@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use codex_core::codex_wrapper::init_codex;
 use codex_core::config::Config;
+use codex_core::protocol::AgentMessageDeltaEvent;
 use codex_core::protocol::AgentMessageEvent;
+use codex_core::protocol::AgentReasoningDeltaEvent;
 use codex_core::protocol::AgentReasoningEvent;
 use codex_core::protocol::ApplyPatchApprovalRequestEvent;
 use codex_core::protocol::ErrorEvent;
@@ -49,6 +51,8 @@ pub(crate) struct ChatWidget<'a> {
     config: Config,
     initial_user_message: Option<UserMessage>,
     token_usage: TokenUsage,
+    reasoning_buffer: String,
+    answer_buffer: String,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -92,14 +96,15 @@ impl ChatWidget<'_> {
         // Create the Codex asynchronously so the UI loads as quickly as possible.
         let config_for_agent_loop = config.clone();
         tokio::spawn(async move {
-            let (codex, session_event, _ctrl_c) = match init_codex(config_for_agent_loop).await {
-                Ok(vals) => vals,
-                Err(e) => {
-                    // TODO: surface this error to the user.
-                    tracing::error!("failed to initialize codex: {e}");
-                    return;
-                }
-            };
+            let (codex, session_event, _ctrl_c, _session_id) =
+                match init_codex(config_for_agent_loop).await {
+                    Ok(vals) => vals,
+                    Err(e) => {
+                        // TODO: surface this error to the user.
+                        tracing::error!("failed to initialize codex: {e}");
+                        return;
+                    }
+                };
 
             // Forward the captured `SessionInitialized` event that was consumed
             // inside `init_codex()` so it can be rendered in the UI.
@@ -135,6 +140,8 @@ impl ChatWidget<'_> {
                 initial_images,
             ),
             token_usage: TokenUsage::default(),
+            reasoning_buffer: String::new(),
+            answer_buffer: String::new(),
         }
     }
 
@@ -171,6 +178,12 @@ impl ChatWidget<'_> {
                 }
                 InputResult::None => {}
             },
+        }
+    }
+
+    pub(crate) fn handle_paste(&mut self, text: String) {
+        if matches!(self.input_focus, InputFocus::BottomPane) {
+            self.bottom_pane.handle_paste(text);
         }
     }
 
@@ -234,16 +247,51 @@ impl ChatWidget<'_> {
                 self.request_redraw();
             }
             EventMsg::AgentMessage(AgentMessageEvent { message }) => {
+                // if the answer buffer is empty, this means we haven't received any
+                // delta. Thus, we need to print the message as a new answer.
+                if self.answer_buffer.is_empty() {
+                    self.conversation_history
+                        .add_agent_message(&self.config, message);
+                } else {
+                    self.conversation_history
+                        .replace_prev_agent_message(&self.config, message);
+                }
+                self.answer_buffer.clear();
+                self.request_redraw();
+            }
+            EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
+                if self.answer_buffer.is_empty() {
+                    self.conversation_history
+                        .add_agent_message(&self.config, "".to_string());
+                }
+                self.answer_buffer.push_str(&delta.clone());
                 self.conversation_history
-                    .add_agent_message(&self.config, message);
+                    .replace_prev_agent_message(&self.config, self.answer_buffer.clone());
+                self.request_redraw();
+            }
+            EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent { delta }) => {
+                if self.reasoning_buffer.is_empty() {
+                    self.conversation_history
+                        .add_agent_reasoning(&self.config, "".to_string());
+                }
+                self.reasoning_buffer.push_str(&delta.clone());
+                self.conversation_history
+                    .replace_prev_agent_reasoning(&self.config, self.reasoning_buffer.clone());
                 self.request_redraw();
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
-                if !self.config.hide_agent_reasoning {
+                // if the reasoning buffer is empty, this means we haven't received any
+                // delta. Thus, we need to print the message as a new reasoning.
+                if self.reasoning_buffer.is_empty() {
                     self.conversation_history
-                        .add_agent_reasoning(&self.config, text);
-                    self.request_redraw();
+                        .add_agent_reasoning(&self.config, "".to_string());
+                } else {
+                    // else, we rerender one last time.
+                    self.conversation_history
+                        .replace_prev_agent_reasoning(&self.config, text);
                 }
+                self.reasoning_buffer.clear();
+                self.request_redraw();
             }
             EventMsg::TaskStarted => {
                 self.bottom_pane.clear_ctrl_c_quit_hint();
@@ -266,6 +314,7 @@ impl ChatWidget<'_> {
                 self.bottom_pane.set_task_running(false);
             }
             EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
+                call_id: _,
                 command,
                 cwd,
                 reason,
@@ -279,6 +328,7 @@ impl ChatWidget<'_> {
                 self.bottom_pane.push_approval_request(request);
             }
             EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
+                call_id: _,
                 changes,
                 reason,
                 grant_root,
@@ -314,7 +364,7 @@ impl ChatWidget<'_> {
                 cwd: _,
             }) => {
                 self.conversation_history
-                    .add_active_exec_command(call_id, command);
+                    .reset_or_add_active_exec_command(call_id, command);
                 self.request_redraw();
             }
             EventMsg::PatchApplyBegin(PatchApplyBeginEvent {
@@ -369,6 +419,9 @@ impl ChatWidget<'_> {
                 self.bottom_pane
                     .on_history_entry_response(log_id, offset, entry.map(|e| e.text));
             }
+            EventMsg::ShutdownComplete => {
+                self.app_event_tx.send(AppEvent::ExitRequest);
+            }
             event => {
                 self.conversation_history
                     .add_background_event(format!("{event:?}"));
@@ -384,7 +437,7 @@ impl ChatWidget<'_> {
     }
 
     fn request_redraw(&mut self) {
-        self.app_event_tx.send(AppEvent::Redraw);
+        self.app_event_tx.send(AppEvent::RequestRedraw);
     }
 
     pub(crate) fn add_diff_output(&mut self, diff_output: String) {
@@ -417,13 +470,20 @@ impl ChatWidget<'_> {
         if self.bottom_pane.is_task_running() {
             self.bottom_pane.clear_ctrl_c_quit_hint();
             self.submit_op(Op::Interrupt);
+            self.answer_buffer.clear();
+            self.reasoning_buffer.clear();
             false
         } else if self.bottom_pane.ctrl_c_quit_hint_visible() {
+            self.submit_op(Op::Shutdown);
             true
         } else {
             self.bottom_pane.show_ctrl_c_quit_hint();
             false
         }
+    }
+
+    pub(crate) fn composer_is_empty(&self) -> bool {
+        self.bottom_pane.composer_is_empty()
     }
 
     /// Forward an `Op` directly to codex.

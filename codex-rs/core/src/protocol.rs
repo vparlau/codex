@@ -44,8 +44,12 @@ pub enum Op {
         model_reasoning_effort: ReasoningEffortConfig,
         model_reasoning_summary: ReasoningSummaryConfig,
 
-        /// Model instructions
-        instructions: Option<String>,
+        /// Model instructions that are appended to the base instructions.
+        user_instructions: Option<String>,
+
+        /// Base instructions override.
+        base_instructions: Option<String>,
+
         /// When to escalate for approval for execution
         approval_policy: AskForApproval,
         /// How to sandbox commands executed in the system
@@ -69,6 +73,10 @@ pub enum Op {
         /// `ConfigureSession` operation so that the business-logic layer can
         /// operate deterministically.
         cwd: std::path::PathBuf,
+
+        /// Path to a rollout file to resume from.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resume_path: Option<std::path::PathBuf>,
     },
 
     /// Abort current task.
@@ -108,6 +116,9 @@ pub enum Op {
 
     /// Request a single history entry identified by `log_id` + `offset`.
     GetHistoryEntryRequest { offset: usize, log_id: u64 },
+
+    /// Request to shut down codex instance.
+    Shutdown,
 }
 
 /// Determines the conditions under which the user is consulted to approve
@@ -282,8 +293,14 @@ pub enum EventMsg {
     /// Agent text output message
     AgentMessage(AgentMessageEvent),
 
+    /// Agent text output delta message
+    AgentMessageDelta(AgentMessageDeltaEvent),
+
     /// Reasoning event from agent.
     AgentReasoning(AgentReasoningEvent),
+
+    /// Agent reasoning delta event from agent.
+    AgentReasoningDelta(AgentReasoningDeltaEvent),
 
     /// Ack the client's configure message.
     SessionConfigured(SessionConfiguredEvent),
@@ -312,6 +329,9 @@ pub enum EventMsg {
 
     /// Response to GetHistoryEntryRequest.
     GetHistoryEntryResponse(GetHistoryEntryResponseEvent),
+
+    /// Notification that the agent is shutting down.
+    ShutdownComplete,
 }
 
 // Individual event payload types matching each `EventMsg` variant.
@@ -341,8 +361,18 @@ pub struct AgentMessageEvent {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgentMessageDeltaEvent {
+    pub delta: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentReasoningEvent {
     pub text: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgentReasoningDeltaEvent {
+    pub delta: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -398,6 +428,8 @@ pub struct ExecCommandEndEvent {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ExecApprovalRequestEvent {
+    /// Identifier for the associated exec call, if available.
+    pub call_id: String,
     /// The command to be executed.
     pub command: Vec<String>,
     /// The command's working directory.
@@ -409,6 +441,8 @@ pub struct ExecApprovalRequestEvent {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ApplyPatchApprovalRequestEvent {
+    /// Responses API call id for the associated patch apply call, if available.
+    pub call_id: String,
     pub changes: HashMap<PathBuf, FileChange>,
     /// Optional explanatory reason (e.g. request for extra write access).
     #[serde(skip_serializing_if = "Option::is_none")]
